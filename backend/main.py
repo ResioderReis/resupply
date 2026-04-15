@@ -1,9 +1,11 @@
 from fastapi import FastAPI, UploadFile, File, Query
+from fastapi.responses import Response
 from typing import List
 import gpxpy
 from route_sampling import sample_route
-from route_analysis import classify_poi_route_proximity
 from overpass import fetch_pois_from_osm, POI_CATEGORIES
+from kml_export import generate_kml
+from route_analysis import DETOUR_TYPE_ORDER
 
 app = FastAPI()
 
@@ -23,12 +25,11 @@ def get_categories():
 async def upload_gpx(
     file: UploadFile = File(...),
     interval: float = Query(default=500.0, description="Sampling-Intervall in Metern"),
-    radius: int = Query(default=500, description="Suchradius fÃ¼r POIs in Metern"),
-    categories: List[str] = Query(default=None, description="POI-Kategorien, z.B. supermarket,water"),
-    direct_route_threshold: float = Query(
-        default=75.0,
-        description="Maximale Distanz zur Route in Metern, damit ein POI als direkt an der Route gilt"
-    )
+    radius: int = Query(default=500, description="Suchradius für POIs in Metern"),
+    categories: List[str] = Query(default=None, description="POI-Kategorien"),
+    export: str = Query(default="json", description="Ausgabeformat: json oder kml"),
+    include_route: bool = Query(default=True, description="Route als Linie in KML einzeichnen"),
+    max_detour: str = Query(default="detour", description="Maximaler Umweg: direct, minor oder detour")
 ):
     content = await file.read()
     gpx = gpxpy.parse(content.decode("utf-8"))
@@ -43,20 +44,25 @@ async def upload_gpx(
         return {"error": "Keine Punkte in der GPX-Datei gefunden"}
 
     sampled = sample_route(raw_points, interval=interval)
-    pois = await fetch_pois_from_osm(sampled, radius=radius, categories=categories)
+    pois = await fetch_pois_from_osm(sampled, raw_points, radius=radius, categories=categories)
+
+    # Umweg-Filter anwenden
+    max_level = DETOUR_TYPE_ORDER.get(max_detour, DETOUR_TYPE_ORDER["detour"])
     pois = [
-        {
-            **poi,
-            **classify_poi_route_proximity(
-                raw_points,
-                poi,
-                direct_route_threshold=direct_route_threshold
-            ),
-        }
-        for poi in pois
+        p for p in pois
+        if DETOUR_TYPE_ORDER.get(p.get("detour_type", "detour"), DETOUR_TYPE_ORDER["detour"]) <= max_level
     ]
 
-    # POIs nach Kategorie gruppieren fÃ¼r Ã¼bersichtliche Ausgabe
+    if export == "kml":
+        route_for_kml = raw_points if include_route else None
+        kml_string = generate_kml(pois, route_points=route_for_kml)
+        return Response(
+            content=kml_string,
+            media_type="application/vnd.google-earth.kml+xml",
+            headers={"Content-Disposition": "attachment; filename=resupply.kml"}
+        )
+
+    # Standard: JSON
     by_category = {}
     for poi in pois:
         cat = poi["category_label"]
@@ -67,7 +73,6 @@ async def upload_gpx(
         "sampled_points_count": len(sampled),
         "interval_meters": interval,
         "radius_meters": radius,
-        "direct_route_threshold_meters": direct_route_threshold,
         "total_pois_found": len(pois),
         "by_category": {cat: len(items) for cat, items in by_category.items()},
         "pois": pois

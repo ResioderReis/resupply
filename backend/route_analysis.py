@@ -1,6 +1,11 @@
 import math
 from typing import Dict, List
 
+DETOUR_TYPE_ORDER = {"direct": 0, "minor": 1, "detour": 2}
+
+DIRECT_DISTANCE_THRESHOLD_METERS = 50.0
+MINOR_DISTANCE_THRESHOLD_METERS = 300.0
+
 
 def _project_to_local_meters(lat: float, lon: float, ref_lat: float, ref_lon: float) -> tuple[float, float]:
     lat_scale = 111_320.0
@@ -34,17 +39,16 @@ def distance_point_to_segment_meters(point: Dict, start: Dict, end: Dict) -> flo
     return math.hypot(px - nearest_x, py - nearest_y)
 
 
-def classify_poi_route_proximity(
-    route_points: List[Dict],
-    poi: Dict,
-    direct_route_threshold: float = 75.0
-) -> Dict:
+def classify_poi_route_proximity(route_points: List[Dict], poi: Dict) -> Dict:
     if len(route_points) < 2:
         return {
             "distance_to_route_meters": None,
             "is_on_route": False,
             "requires_detour": False,
             "estimated_detour_meters": None,
+            "detour_meters": None,
+            "detour_type": "detour",
+            "detour_label": "Umweg erforderlich",
         }
 
     poi_point = {"lat": poi["lat"], "lon": poi["lon"]}
@@ -52,13 +56,26 @@ def classify_poi_route_proximity(
         distance_point_to_segment_meters(poi_point, route_points[i - 1], route_points[i])
         for i in range(1, len(route_points))
     )
+    detour_meters = round(min_distance * 2, 1)
 
-    requires_detour = min_distance > direct_route_threshold
+    if min_distance <= DIRECT_DISTANCE_THRESHOLD_METERS:
+        detour_type = "direct"
+        detour_label = "Direkt an der Route"
+    elif min_distance <= MINOR_DISTANCE_THRESHOLD_METERS:
+        detour_type = "minor"
+        detour_label = f"Kleiner Umweg ({detour_meters} m)"
+    else:
+        detour_type = "detour"
+        detour_label = f"Umweg erforderlich ({detour_meters} m)"
+
+    requires_detour = detour_type != "direct"
 
     return {
         "distance_to_route_meters": round(min_distance, 1),
         "is_on_route": not requires_detour,
         "requires_detour": requires_detour,
-        # Luftlinien-Schätzwert für Hin- und Rückweg von der Route.
-        "estimated_detour_meters": round(min_distance * 2, 1) if requires_detour else 0.0,
+        "estimated_detour_meters": detour_meters,
+        "detour_meters": detour_meters,
+        "detour_type": detour_type,
+        "detour_label": detour_label,
     }

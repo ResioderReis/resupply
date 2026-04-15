@@ -1,13 +1,14 @@
 import httpx
-from route_sampling import haversine
+import asyncio
 from typing import List, Dict
+from route_analysis import classify_poi_route_proximity
 
 # ------------------------------------------------------------------
 # Kategorie-Definitionen
 # Jede Kategorie hat einen Namen und die passenden OSM-Tags.
 # OSM nutzt ein Key=Value System: amenity=supermarket bedeutet
 # "ein Objekt mit dem Tag amenity dessen Wert supermarket ist".
-# Du kannst hier jederzeit neue Kategorien ergänzen.
+# Du kannst hier jederzeit neue Kategorien ergÃ¤nzen.
 # ------------------------------------------------------------------
 POI_CATEGORIES = {
     "supermarket": {
@@ -35,23 +36,23 @@ POI_CATEGORIES = {
 
 # ------------------------------------------------------------------
 # Overpass Query bauen
-# Overpass QL ist die Abfragesprache für OSM-Daten.
-# Wir bauen eine einzige große Anfrage für alle Kategorien
-# und alle Stützpunkte gleichzeitig — das ist viel effizienter
-# als für jeden Punkt eine separate Anfrage zu schicken.
+# Overpass QL ist die Abfragesprache fÃ¼r OSM-Daten.
+# Wir bauen eine einzige groÃŸe Anfrage fÃ¼r alle Kategorien
+# und alle StÃ¼tzpunkte gleichzeitig â€” das ist viel effizienter
+# als fÃ¼r jeden Punkt eine separate Anfrage zu schicken.
 #
-# "around:RADIUS,LAT,LON" ist der OSM-Filter für "im Umkreis von"
+# "around:RADIUS,LAT,LON" ist der OSM-Filter fÃ¼r "im Umkreis von"
 # ------------------------------------------------------------------
 def build_overpass_query(sampled_points: List[Dict], radius: int, categories: List[str]) -> str:
     
-    # Nur die gewählten Kategorien abfragen
+    # Nur die gewÃ¤hlten Kategorien abfragen
     active_tags = []
     for cat in categories:
         if cat in POI_CATEGORIES:
             active_tags.extend(POI_CATEGORIES[cat]["tags"])
 
-    # Für jeden Tag und jeden Punkt eine Suchzeile bauen
-    # OSM kennt zwei Objekttypen die uns interessieren: node (Punkt) und way (Fläche/Gebäude)
+    # FÃ¼r jeden Tag und jeden Punkt eine Suchzeile bauen
+    # OSM kennt zwei Objekttypen die uns interessieren: node (Punkt) und way (FlÃ¤che/GebÃ¤ude)
     lines = []
     for key, value in active_tags:
         for point in sampled_points:
@@ -73,60 +74,28 @@ out center tags;
 
 # ------------------------------------------------------------------
 # Deduplizierung
-# Weil sich die Suchkreise der Stützpunkte überlappen,
+# Weil sich die Suchkreise der StÃ¼tzpunkte Ã¼berlappen,
 # wird derselbe Supermarkt oft 3-4x gefunden.
-# Wir nutzen die OSM-ID als eindeutigen Schlüssel.
+# Wir nutzen OSM-Typ + OSM-ID als eindeutigen SchlÃ¼ssel.
 # ------------------------------------------------------------------
 def deduplicate_pois(raw_elements: List[Dict]) -> List[Dict]:
     seen_ids = set()
     unique = []
 
     for el in raw_elements:
-        osm_id = el.get("id")
-        if osm_id not in seen_ids:
-            seen_ids.add(osm_id)
+        osm_key = (el.get("type"), el.get("id"))
+        if osm_key not in seen_ids:
+            seen_ids.add(osm_key)
             unique.append(el)
 
     return unique
 
 # ------------------------------------------------------------------
-# Umweg-Berechnung
-# Findet den nächsten Routenpunkt zum POI und klassifiziert
-# ob der POI direkt anliegt oder einen Umweg erfordert.
-# Umweg = Luftlinie zum nächsten Routenpunkt × 2 (hin und zurück)
-# ------------------------------------------------------------------
-def calculate_detour(poi_lat: float, poi_lon: float, sampled_points: List[Dict]) -> Dict:
-    min_distance = float("inf")
-
-    for point in sampled_points:
-        dist = haversine(poi_lat, poi_lon, point["lat"], point["lon"])
-        if dist < min_distance:
-            min_distance = dist
-
-    detour_meters = round(min_distance * 2)  # hin + zurück
-
-    if min_distance <= 50:
-        detour_type = "direct"
-        detour_label = "Direkt an der Route"
-    elif min_distance <= 300:
-        detour_type = "minor"
-        detour_label = f"Kleiner Umweg ({detour_meters}m)"
-    else:
-        detour_type = "detour"
-        detour_label = f"Umweg erforderlich ({detour_meters}m)"
-
-    return {
-        "detour_meters": detour_meters,
-        "detour_type": detour_type,
-        "detour_label": detour_label,
-    }
-
-# ------------------------------------------------------------------
 # OSM-Rohdaten in saubere POI-Objekte umwandeln
-# OSM-Elemente können "nodes" (haben lat/lon direkt) oder
+# OSM-Elemente kÃ¶nnen "nodes" (haben lat/lon direkt) oder
 # "ways" sein (haben ein "center" Objekt mit lat/lon).
 # ------------------------------------------------------------------
-def parse_poi(element: Dict, sampled_points: List[Dict]) -> Dict:
+def parse_poi(element: Dict, route_points: List[Dict]) -> Dict:
     tags = element.get("tags", {})
 
     if element["type"] == "node":
@@ -145,7 +114,7 @@ def parse_poi(element: Dict, sampled_points: List[Dict]) -> Dict:
                 category_label = cat_data["label"]
                 break
 
-    detour = calculate_detour(lat, lon, sampled_points)
+    detour = classify_poi_route_proximity(route_points, {"lat": lat, "lon": lon})
 
     return {
         "osm_id": element["id"],
@@ -159,14 +128,14 @@ def parse_poi(element: Dict, sampled_points: List[Dict]) -> Dict:
         "phone": tags.get("phone") or tags.get("contact:phone"),
         "website": tags.get("website") or tags.get("contact:website"),
         "brand": tags.get("brand"),
-        **detour,  # detour_meters, detour_type, detour_label werden hier eingefügt
+        **detour,
     }
 
 
 # ------------------------------------------------------------------
 # Hauptfunktion: Overpass API aufrufen
-# Wir nutzen httpx statt requests weil FastAPI async ist —
-# mit requests würde der Server während der API-Anfrage blockieren.
+# Wir nutzen httpx statt requests weil FastAPI async ist â€”
+# mit requests wÃ¼rde der Server wÃ¤hrend der API-Anfrage blockieren.
 # ------------------------------------------------------------------
 async def fetch_pois_from_osm(
     sampled_points: List[Dict],
@@ -175,20 +144,36 @@ async def fetch_pois_from_osm(
 ) -> List[Dict]:
 
     if categories is None:
-        categories = list(POI_CATEGORIES.keys())  # alle Kategorien
+        categories = list(POI_CATEGORIES.keys())
 
-    query = build_overpass_query(sampled_points, radius, categories)
+    # Punkte in Batches à 30 aufteilen
+    # 30 Punkte × 5 Kategorien = überschaubare Query-Größe
+    BATCH_SIZE = 30
+    batches = [sampled_points[i:i + BATCH_SIZE] for i in range(0, len(sampled_points), BATCH_SIZE)]
 
-    # Overpass hat mehrere öffentliche Server — wir nehmen den deutschen
-    overpass_url = "https://overpass-api.de/api/interpreter"
+    all_elements = []
 
     async with httpx.AsyncClient(timeout=90.0) as client:
-        response = await client.post(overpass_url, data={"data": query})
-        response.raise_for_status()
-        data = response.json()
+        for batch in batches:
+            query = build_overpass_query(batch, radius, categories)
+            try:
+                response = await client.post(
+                    "https://overpass-api.de/api/interpreter",
+                    data={"data": query}
+                )
+                response.raise_for_status()
+                data = response.json()
+                all_elements.extend(data.get("elements", []))
 
-    raw_elements = data.get("elements", [])
-    unique_elements = deduplicate_pois(raw_elements)
+                # Kurze Pause zwischen Batches — Overpass fair-use Policy
+                await asyncio.sleep(1)
+
+            except httpx.HTTPStatusError as e:
+                # Einen fehlgeschlagenen Batch überspringen statt alles abbrechen
+                print(f"Batch fehlgeschlagen: {e} — überspringe und mache weiter")
+                continue
+
+    unique_elements = deduplicate_pois(all_elements)
     pois = [parse_poi(el, sampled_points) for el in unique_elements]
 
     return pois
