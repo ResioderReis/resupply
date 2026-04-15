@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Query
+﻿from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.responses import Response
 from typing import List
 import gpxpy
@@ -12,12 +12,12 @@ app = FastAPI()
 
 @app.get("/")
 def root():
-    return {"message": "Resupply API lÃ¤uft"}
+    return {"message": "Resupply API läuft"}
 
 
 @app.get("/categories")
 def get_categories():
-    # Zeigt dem Frontend welche Kategorien verfÃ¼gbar sind
+    # Zeigt dem Frontend welche Kategorien verfügbar sind
     return {key: val["label"] for key, val in POI_CATEGORIES.items()}
 
 
@@ -27,7 +27,7 @@ async def upload_gpx(
     interval: float = Query(default=500.0, description="Sampling-Intervall in Metern"),
     radius: int = Query(default=500, description="Suchradius für POIs in Metern"),
     categories: List[str] = Query(default=None, description="POI-Kategorien"),
-    export: str = Query(default="json", description="Ausgabeformat: json oder kml"),
+    export: str = Query(default="both", description="Ausgabeformat: json, kml oder both"),
     include_route: bool = Query(default=True, description="Route als Linie in KML einzeichnen"),
     max_detour: str = Query(default="detour", description="Maximaler Umweg: direct, minor oder detour")
 ):
@@ -44,7 +44,8 @@ async def upload_gpx(
         return {"error": "Keine Punkte in der GPX-Datei gefunden"}
 
     sampled = sample_route(raw_points, interval=interval)
-    pois = await fetch_pois_from_osm(sampled, raw_points, radius=radius, categories=categories)
+    fetch_result = await fetch_pois_from_osm(sampled, raw_points, radius=radius, categories=categories)
+    pois = fetch_result["pois"]
 
     # Umweg-Filter anwenden
     max_level = DETOUR_TYPE_ORDER.get(max_detour, DETOUR_TYPE_ORDER["detour"])
@@ -53,16 +54,21 @@ async def upload_gpx(
         if DETOUR_TYPE_ORDER.get(p.get("detour_type", "detour"), DETOUR_TYPE_ORDER["detour"]) <= max_level
     ]
 
+    route_for_kml = raw_points if include_route else None
+    kml_string = generate_kml(pois, route_points=route_for_kml)
+
     if export == "kml":
-        route_for_kml = raw_points if include_route else None
-        kml_string = generate_kml(pois, route_points=route_for_kml)
         return Response(
             content=kml_string,
             media_type="application/vnd.google-earth.kml+xml",
             headers={"Content-Disposition": "attachment; filename=resupply.kml"}
         )
 
-    # Standard: JSON
+    failed_batches = [
+        batch for batch in fetch_result["batch_reports"]
+        if batch["status"] == "failed"
+    ]
+
     by_category = {}
     for poi in pois:
         cat = poi["category_label"]
@@ -73,7 +79,19 @@ async def upload_gpx(
         "sampled_points_count": len(sampled),
         "interval_meters": interval,
         "radius_meters": radius,
+        "batch_summary": {
+            "total_batches": fetch_result["total_batches"],
+            "successful_batches_count": fetch_result["successful_batches_count"],
+            "failed_batches_count": fetch_result["failed_batches_count"],
+            "is_complete": fetch_result["failed_batches_count"] == 0,
+        },
+        "failed_batches": failed_batches,
         "total_pois_found": len(pois),
         "by_category": {cat: len(items) for cat, items in by_category.items()},
-        "pois": pois
+        "pois": pois,
+        "kml_export": {
+            "filename": "resupply.kml",
+            "media_type": "application/vnd.google-earth.kml+xml",
+            "content": kml_string,
+        } if export == "both" else None,
     }
