@@ -1,5 +1,5 @@
 import httpx
-import asyncio
+from route_sampling import haversine
 from typing import List, Dict
 
 # ------------------------------------------------------------------
@@ -89,25 +89,53 @@ def deduplicate_pois(raw_elements: List[Dict]) -> List[Dict]:
 
     return unique
 
+# ------------------------------------------------------------------
+# Umweg-Berechnung
+# Findet den nächsten Routenpunkt zum POI und klassifiziert
+# ob der POI direkt anliegt oder einen Umweg erfordert.
+# Umweg = Luftlinie zum nächsten Routenpunkt × 2 (hin und zurück)
+# ------------------------------------------------------------------
+def calculate_detour(poi_lat: float, poi_lon: float, sampled_points: List[Dict]) -> Dict:
+    min_distance = float("inf")
+
+    for point in sampled_points:
+        dist = haversine(poi_lat, poi_lon, point["lat"], point["lon"])
+        if dist < min_distance:
+            min_distance = dist
+
+    detour_meters = round(min_distance * 2)  # hin + zurück
+
+    if min_distance <= 50:
+        detour_type = "direct"
+        detour_label = "Direkt an der Route"
+    elif min_distance <= 300:
+        detour_type = "minor"
+        detour_label = f"Kleiner Umweg ({detour_meters}m)"
+    else:
+        detour_type = "detour"
+        detour_label = f"Umweg erforderlich ({detour_meters}m)"
+
+    return {
+        "detour_meters": detour_meters,
+        "detour_type": detour_type,
+        "detour_label": detour_label,
+    }
 
 # ------------------------------------------------------------------
 # OSM-Rohdaten in saubere POI-Objekte umwandeln
 # OSM-Elemente können "nodes" (haben lat/lon direkt) oder
 # "ways" sein (haben ein "center" Objekt mit lat/lon).
 # ------------------------------------------------------------------
-def parse_poi(element: Dict) -> Dict:
+def parse_poi(element: Dict, sampled_points: List[Dict]) -> Dict:
     tags = element.get("tags", {})
 
-    # Koordinaten je nach Objekttyp auslesen
     if element["type"] == "node":
         lat = element["lat"]
         lon = element["lon"]
     else:
-        # way/relation → Mittelpunkt nehmen
         lat = element["center"]["lat"]
         lon = element["center"]["lon"]
 
-    # Kategorie anhand der Tags bestimmen
     category = "sonstige"
     category_label = "Sonstiges"
     for cat_key, cat_data in POI_CATEGORIES.items():
@@ -117,6 +145,8 @@ def parse_poi(element: Dict) -> Dict:
                 category_label = cat_data["label"]
                 break
 
+    detour = calculate_detour(lat, lon, sampled_points)
+
     return {
         "osm_id": element["id"],
         "osm_type": element["type"],
@@ -125,11 +155,11 @@ def parse_poi(element: Dict) -> Dict:
         "category_label": category_label,
         "lat": lat,
         "lon": lon,
-        # OSM-Felder die manchmal vorhanden sind
         "opening_hours": tags.get("opening_hours"),
         "phone": tags.get("phone") or tags.get("contact:phone"),
         "website": tags.get("website") or tags.get("contact:website"),
         "brand": tags.get("brand"),
+        **detour,  # detour_meters, detour_type, detour_label werden hier eingefügt
     }
 
 
@@ -159,6 +189,6 @@ async def fetch_pois_from_osm(
 
     raw_elements = data.get("elements", [])
     unique_elements = deduplicate_pois(raw_elements)
-    pois = [parse_poi(el) for el in unique_elements]
+    pois = [parse_poi(el, sampled_points) for el in unique_elements]
 
     return pois
