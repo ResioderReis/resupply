@@ -1,6 +1,5 @@
 from typing import List, Dict
 import xml.etree.ElementTree as ET
-from route_analysis import DETOUR_TYPE_ORDER
 
 # ------------------------------------------------------------------
 # Farbe + Icon pro Kategorie (Google Maps KML-Format)
@@ -16,6 +15,8 @@ CATEGORY_STYLES = {
     "pharmacy":      {"color": "ff00aa00", "icon": "https://maps.google.com/mapfiles/kml/shapes/hospitals.png"},
     "sonstige":      {"color": "ff888888", "icon": "https://maps.google.com/mapfiles/kml/shapes/placemark_circle.png"},
 }
+
+DETOUR_TYPE_ORDER = {"direct": 0, "minor": 1, "detour": 2}
 
 def build_description(poi: Dict) -> str:
     # HTML-Tabelle als Popup-Text in Google Maps
@@ -38,12 +39,12 @@ def build_description(poi: Dict) -> str:
     return f"<table>{''.join(rows)}</table>"
 
 
-def generate_kml(pois: List[Dict], route_points: List[Dict] = None) -> str:
+def generate_kml(pois: List[Dict]) -> str:
     # Wurzel-Element
     kml = ET.Element("kml", xmlns="http://www.opengis.net/kml/2.2")
     doc = ET.SubElement(kml, "Document")
     ET.SubElement(doc, "name").text = "Resupply POIs"
-    ET.SubElement(doc, "description").text = f"{len(pois)} POIs entlang der Route"
+    ET.SubElement(doc, "description").text = f"{len(pois)} POIs"
 
     # Styles pro Kategorie definieren (Google Maps liest diese für Icons/Farben)
     for cat_key, style_data in CATEGORY_STYLES.items():
@@ -84,23 +85,5 @@ def generate_kml(pois: List[Dict], route_points: List[Dict] = None) -> str:
 
             point = ET.SubElement(placemark, "Point")
             ET.SubElement(point, "coordinates").text = f"{poi['lon']},{poi['lat']},0"
-
-    # Optional: Route als Linie einzeichnen
-    if route_points:
-        folder = ET.SubElement(doc, "Folder")
-        ET.SubElement(folder, "name").text = "Route"
-
-        line_style = ET.SubElement(doc, "Style", id="style_route")
-        line_style_el = ET.SubElement(line_style, "LineStyle")
-        ET.SubElement(line_style_el, "color").text = "ffff6600"
-        ET.SubElement(line_style_el, "width").text = "3"
-
-        placemark = ET.SubElement(folder, "Placemark")
-        ET.SubElement(placemark, "name").text = "Route"
-        ET.SubElement(placemark, "styleUrl").text = "#style_route"
-        linestring = ET.SubElement(placemark, "LineString")
-        ET.SubElement(linestring, "tessellate").text = "1"
-        coords = " ".join(f"{p['lon']},{p['lat']},0" for p in route_points)
-        ET.SubElement(linestring, "coordinates").text = coords
 
     return ET.tostring(kml, encoding="unicode", xml_declaration=False)
