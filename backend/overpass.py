@@ -1,7 +1,10 @@
 import asyncio
 import httpx
+import logging
 from typing import List, Dict
 from route_analysis import classify_poi_route_proximity
+
+logger = logging.getLogger(__name__)
 
 OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
@@ -12,6 +15,17 @@ OVERPASS_URLS = [
 DEFAULT_BATCH_SIZE = 20
 MAX_RETRIES_PER_BATCH = 2
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _get_batch_bounds(batch: List[Dict]) -> Dict:
+    lats = [point["lat"] for point in batch]
+    lons = [point["lon"] for point in batch]
+    return {
+        "min_lat": min(lats),
+        "min_lon": min(lons),
+        "max_lat": max(lats),
+        "max_lon": max(lons),
+    }
 
 # ------------------------------------------------------------------
 # Kategorie-Definitionen
@@ -167,6 +181,19 @@ async def fetch_pois_from_osm(
             batch_successful = False
             batch_errors = []
             successful_url = None
+            batch_id = f"batch-{batch_index}"
+            start_point = batch[0]
+            end_point = batch[-1]
+            bounding_box = _get_batch_bounds(batch)
+            poi_count = 0
+
+            logger.info(
+                "Starting %s start=%s end=%s bbox=%s",
+                batch_id,
+                start_point,
+                end_point,
+                bounding_box,
+            )
 
             for attempt in range(1, MAX_RETRIES_PER_BATCH + 1):
                 for overpass_url in OVERPASS_URLS:
@@ -174,9 +201,17 @@ async def fetch_pois_from_osm(
                         response = await client.post(overpass_url, data={"data": query})
                         response.raise_for_status()
                         data = response.json()
-                        all_elements.extend(data.get("elements", []))
+                        batch_elements = data.get("elements", [])
+                        poi_count = len(batch_elements)
+                        all_elements.extend(batch_elements)
                         batch_successful = True
                         successful_url = overpass_url
+                        logger.info(
+                            "Batch success %s endpoint=%s pois=%s",
+                            batch_id,
+                            overpass_url,
+                            poi_count,
+                        )
                         break
                     except httpx.HTTPStatusError as e:
                         status_code = e.response.status_code
@@ -189,12 +224,23 @@ async def fetch_pois_from_osm(
                         batch_errors.append(error_info)
 
                         if status_code not in RETRYABLE_STATUS_CODES:
-                            print(f"Batch fehlgeschlagen: {e} - nicht erneut versuchen")
+                            logger.warning(
+                                "Batch failed %s endpoint=%s status=%s retry=false error=%s",
+                                batch_id,
+                                overpass_url,
+                                status_code,
+                                e,
+                            )
                             break
 
-                        print(
-                            f"Batch fehlgeschlagen auf {overpass_url} "
-                            f"(Versuch {attempt}/{MAX_RETRIES_PER_BATCH}): {e}"
+                        logger.warning(
+                            "Batch failed %s endpoint=%s attempt=%s/%s status=%s error=%s",
+                            batch_id,
+                            overpass_url,
+                            attempt,
+                            MAX_RETRIES_PER_BATCH,
+                            status_code,
+                            e,
                         )
                     except httpx.HTTPError as e:
                         batch_errors.append({
@@ -203,9 +249,13 @@ async def fetch_pois_from_osm(
                             "status_code": None,
                             "message": str(e),
                         })
-                        print(
-                            f"Batch fehlgeschlagen auf {overpass_url} "
-                            f"(Versuch {attempt}/{MAX_RETRIES_PER_BATCH}): {e}"
+                        logger.warning(
+                            "Batch failed %s endpoint=%s attempt=%s/%s error=%s",
+                            batch_id,
+                            overpass_url,
+                            attempt,
+                            MAX_RETRIES_PER_BATCH,
+                            e,
                         )
 
                 if batch_successful:
@@ -214,17 +264,21 @@ async def fetch_pois_from_osm(
                 await asyncio.sleep(attempt)
 
             batch_report = {
+                "batch_id": batch_id,
                 "batch_index": batch_index,
                 "batch_size": len(batch),
-                "status": "ok" if batch_successful else "failed",
-                "sampled_points": batch,
+                "status": "success" if batch_successful else "failed",
+                "start_coordinate": start_point,
+                "end_coordinate": end_point,
+                "bounding_box": bounding_box,
+                "poi_count": poi_count,
                 "successful_url": successful_url,
                 "errors": batch_errors,
             }
             batch_reports.append(batch_report)
 
             if not batch_successful:
-                print("Batch endgültig fehlgeschlagen - überspringe und mache weiter")
+                logger.warning("Batch failed permanently %s", batch_id)
                 continue
 
             await asyncio.sleep(1)
@@ -232,12 +286,15 @@ async def fetch_pois_from_osm(
     unique_elements = deduplicate_pois(all_elements)
     pois = [parse_poi(el, route_points) for el in unique_elements]
     failed_batches_count = sum(1 for batch in batch_reports if batch["status"] == "failed")
-    successful_batches_count = sum(1 for batch in batch_reports if batch["status"] == "ok")
+    successful_batches_count = sum(1 for batch in batch_reports if batch["status"] == "success")
+    total_batches = len(batch_reports)
+    coverage_percent = round((successful_batches_count / total_batches) * 100, 1) if total_batches else 100.0
 
     return {
         "pois": pois,
         "batch_reports": batch_reports,
         "failed_batches_count": failed_batches_count,
         "successful_batches_count": successful_batches_count,
-        "total_batches": len(batch_reports),
+        "total_batches": total_batches,
+        "coverage_percent": coverage_percent,
     }
